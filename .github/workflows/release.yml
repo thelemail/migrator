@@ -110,63 +110,6 @@ jobs:
           path: dist/Thelemail-Migrator-*-macos.zip
           if-no-files-found: error
 
-  windows:
-    needs: verify
-    runs-on: windows-2025
-    environment: release
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
-        with:
-          go-version-file: engine/go.mod
-          cache: false
-
-      - uses: ./.github/actions/private-modules
-        with:
-          token: ${{ secrets.TRUST_READ_TOKEN }}
-
-      - name: Build
-        shell: bash
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
-          ./scripts/build-release.sh
-
-      - uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-      - uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
-        with:
-          endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
-          signing-account-name: ${{ vars.AZURE_SIGNING_ACCOUNT }}
-          certificate-profile-name: ${{ vars.AZURE_CERTIFICATE_PROFILE }}
-          files-folder: target/release
-          files-folder-filter: exe
-          file-digest: SHA256
-          timestamp-rfc3161: http://timestamp.acs.microsoft.com
-          timestamp-digest: SHA256
-
-      - name: Package
-        shell: bash
-        env:
-          TAG: ${{ github.ref_name }}
-        run: VERSION="${TAG#v}" ./scripts/package.sh windows
-
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: windows
-          path: dist/thelemail-migrator-*-windows-x86_64.zip
-          if-no-files-found: error
-
   linux:
     needs: verify
     runs-on: ubuntu-24.04
@@ -265,7 +208,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: [macos, windows, linux, provenance]
+    needs: [macos, linux, provenance]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -309,6 +252,6 @@ jobs:
           {
             printf 'Source commit: `%s`\n\n' "$GITHUB_SHA"
             printf 'The engine binaries are reproducible: check out this tag, run scripts/engine-checksums.sh with the Go version in release-metadata.json, and compare with ENGINE-SHA256SUMS.\n'
-            printf 'The Linux archive ships the engine unchanged. The macOS and Windows builds carry the same engine with a code signature added.\n'
+            printf 'The Linux archive ships the engine unchanged. The macOS build carries the same engine with a code signature added.\n'
           } > notes.md
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" --notes-file notes.md dist/*
