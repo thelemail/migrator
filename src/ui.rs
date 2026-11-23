@@ -10,7 +10,7 @@ use gpui_kit::{
     *,
 };
 
-use crate::engine::{Command, Engine, Event, Imports, Resume, Source, log_path};
+use crate::engine::{Command, Engine, Event, Imports, Resume, Source, SourceCheck, log_path};
 
 const PINE: u32 = 0x204030;
 const DEEP: u32 = 0x193527;
@@ -111,6 +111,40 @@ enum Mode {
     Export,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Security {
+    Tls,
+    StartTls,
+}
+
+impl Security {
+    fn parse(value: &str) -> Self {
+        if value == "starttls" {
+            Self::StartTls
+        } else {
+            Self::Tls
+        }
+    }
+    fn wire(self) -> &'static str {
+        match self {
+            Self::Tls => "tls",
+            Self::StartTls => "starttls",
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Self::Tls => "SSL/TLS",
+            Self::StartTls => "STARTTLS",
+        }
+    }
+    fn port(self) -> &'static str {
+        match self {
+            Self::Tls => "993",
+            Self::StartTls => "143",
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Factor {
     Passkey,
@@ -154,6 +188,10 @@ struct Migrator {
     factor: Option<Factor>,
     passkey_code: Option<String>,
     server: Entity<InputState>,
+    port: Entity<InputState>,
+    security: Security,
+    checked: Option<SourceCheck>,
+    checking_source: bool,
     username: Entity<InputState>,
     source_password: Entity<InputState>,
     files: Entity<InputState>,
@@ -190,7 +228,11 @@ impl Migrator {
             email: input("you@example.com", "", false),
             password: input("Your Thelemail password", "", true),
             code: input("Enter your code", "", true),
-            server: input("IMAP server", "imap.hostinger.com", false),
+            server: input("imap.example.com", "", false),
+            port: input("993", "993", false),
+            security: Security::Tls,
+            checked: None,
+            checking_source: false,
             username: input("you@example.com", "", false),
             source_password: input("Mailbox or app password", "", true),
             files: input("Path to your mail archive", "", false),
@@ -253,6 +295,12 @@ impl Migrator {
         self.imports = Imports::default();
         self.resume = None;
         self.checking_keys = false;
+        self.checking_source = false;
+        self.checked = None;
+        self.security = Security::Tls;
+        self.port.update(cx, |input, cx| {
+            input.set_value(Security::Tls.port(), window, cx)
+        });
         for field in [
             &self.password,
             &self.code,
@@ -394,6 +442,14 @@ impl Migrator {
                 self.checking_keys = false;
                 self.imports = import;
             }
+            Event::SourceChecked { check } => {
+                self.busy = false;
+                self.checking_source = false;
+                if self.page == Page::Setup && self.mode == Mode::Imap {
+                    self.checked = Some(check);
+                    self.show(Page::Review, cx);
+                }
+            }
             Event::SignedOut { message } => {
                 self.reset_session(window, cx);
                 if let Some(message) = message.filter(|m| !m.trim().is_empty()) {
@@ -415,6 +471,7 @@ impl Migrator {
                 self.busy = false;
                 self.stopping = false;
                 self.checking_keys = false;
+                self.checking_source = false;
                 self.stopped = self.page == Page::Transfer;
                 self.status = message;
             }
@@ -426,6 +483,7 @@ impl Migrator {
                 self.busy = false;
                 self.stopping = false;
                 self.checking_keys = false;
+                self.checking_source = false;
                 if self.account.is_empty() && code != "busy" {
                     self.reset_session(window, cx);
                 }
@@ -444,13 +502,22 @@ impl Migrator {
         match self.mode {
             Mode::Imap => {
                 let server = text(&self.server);
+                let port = text(&self.port);
                 let username = text(&self.username);
                 let password = self.source_password.read(cx).value().to_string();
                 if server.is_empty() || username.is_empty() || password.is_empty() {
                     return Err("Enter the IMAP server, mailbox login, and password from your old provider.".into());
                 }
+                if server.contains("://") || server.contains('/') || server.contains('@') {
+                    return Err("Enter only the server name, for example imap.example.com.".into());
+                }
+                if !port.is_empty() && !matches!(port.parse::<u16>(), Ok(n) if n > 0) {
+                    return Err("Enter a port number between 1 and 65535.".into());
+                }
                 Ok(Source::Imap {
                     server,
+                    port,
+                    security: self.security.wire().into(),
                     username,
                     password,
                 })
@@ -475,10 +542,35 @@ impl Migrator {
     }
 
     fn review(&mut self, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
         match self.source(cx) {
+            Ok(source) if self.mode == Mode::Imap => {
+                self.checked = None;
+                match self.send(Command::CheckSource { source }) {
+                    Ok(()) => {
+                        self.busy = true;
+                        self.checking_source = true;
+                        self.clear_problem();
+                    }
+                    Err(message) => self.report(message, None),
+                }
+            }
             Ok(_) => self.show(Page::Review, cx),
             Err(message) => self.report(message, None),
         }
+        cx.notify();
+    }
+
+    fn choose_security(&mut self, security: Security, window: &mut Window, cx: &mut Context<Self>) {
+        let port = self.port.read(cx).value().trim().to_owned();
+        if port.is_empty() || port == self.security.port() {
+            self.port
+                .update(cx, |input, cx| input.set_value(security.port(), window, cx));
+        }
+        self.security = security;
+        self.clear_problem();
         cx.notify();
     }
 
@@ -527,6 +619,13 @@ impl Migrator {
         self.mode = match last.kind.as_str() {
             "imap" => {
                 set(&self.server, last.server, window, cx);
+                self.security = Security::parse(&last.security);
+                let port = if last.port.is_empty() {
+                    self.security.port().to_owned()
+                } else {
+                    last.port
+                };
+                set(&self.port, port, window, cx);
                 Mode::Imap
             }
             "files" => {
@@ -1035,12 +1134,30 @@ impl Migrator {
             body = body.child(tabs);
         }
         body = match self.mode {
-            Mode::Imap => body
-                .child(field("IMAP server", &self.server, false))
-                .child(field("Mailbox login", &self.username, false))
-                .child(field("Mailbox password", &self.source_password, false))
-                .child(hint(IconName::FolderClosed, "All folders are included. For Hostinger Titan, use imap.titan.email."))
-                .child(hint(IconName::Info, "Migrator connects with TLS on port 993. For a server on port 143, add :143 and Migrator switches to TLS with STARTTLS before signing in.")),
+            Mode::Imap => {
+                let mut security = row().gap_1();
+                for (id, option) in [("security-tls", Security::Tls), ("security-starttls", Security::StartTls)] {
+                    security = security.child(
+                        Button::new(id)
+                            .label(option.label())
+                            .when(self.security == option, |b| b.primary())
+                            .disabled(self.busy)
+                            .on_click(cx.listener(move |v, _, w, cx| v.choose_security(option, w, cx))),
+                    );
+                }
+                body.child(
+                    row()
+                        .gap_3()
+                        .items_end()
+                        .child(div().flex_1().child(field("IMAP server", &self.server, self.busy)))
+                        .child(div().w(px(104.)).child(field("Port", &self.port, self.busy))),
+                )
+                .child(column().gap_1().child(text("Connection security", 13., MUTED)).child(security))
+                .child(field("Mailbox login", &self.username, self.busy))
+                .child(field("Mailbox password", &self.source_password, self.busy))
+                .child(hint(IconName::Info, "Most providers use port 993 with SSL/TLS. Choose STARTTLS for a server on port 143. Your provider's help pages list its IMAP settings."))
+                .child(hint(IconName::FolderClosed, "Many providers need an app password for IMAP instead of your normal password. Migrator signs in to check the mailbox before anything is copied."))
+            }
             Mode::Files => body
                 .child(field("Mail file or folder", &self.files, false))
                 .child(row().child(Button::new("choose-file").label("Choose file…").on_click(cx.listener(|v,_,w,cx|v.browse(false,w,cx))))
@@ -1058,9 +1175,15 @@ impl Migrator {
                         .primary()
                         .label(if exporting {
                             "Review export"
-                        } else {
+                        } else if self.mode != Mode::Imap {
                             "Review import"
+                        } else if self.checking_source {
+                            "Checking the mailbox…"
+                        } else {
+                            "Check connection"
                         })
+                        .loading(self.checking_source)
+                        .disabled(self.busy)
                         .on_click(cx.listener(|v, _, _, cx| v.review(cx))),
                 )
                 .child(back(Page::Choose, cx)),
@@ -1071,11 +1194,19 @@ impl Migrator {
         let exporting = self.mode == Mode::Export;
         let (source, destination, scope, description) = match self.mode {
             Mode::Imap => (
-                format!(
-                    "{} · {}",
-                    self.username.read(cx).value(),
-                    self.server.read(cx).value()
-                ),
+                match &self.checked {
+                    Some(check) => format!(
+                        "{} · {} ({})",
+                        self.username.read(cx).value(),
+                        check.address,
+                        Security::parse(&check.security).label()
+                    ),
+                    None => format!(
+                        "{} · {}",
+                        self.username.read(cx).value(),
+                        self.server.read(cx).value()
+                    ),
+                },
                 self.account.clone(),
                 "Whole mailbox",
                 "Sent mail and custom folders keep their places. Read and unread messages keep their status.",
@@ -1117,7 +1248,30 @@ impl Migrator {
                     .border_color(rgb(RULE))
                     .child(detail("From", source))
                     .child(detail("To", destination))
-                    .child(detail("Includes", scope.to_owned())),
+                    .child(detail("Includes", scope.to_owned()))
+                    .when_some(
+                        self.checked.as_ref().filter(|_| self.mode == Mode::Imap),
+                        |list, check| {
+                            list.child(detail(
+                                "Found",
+                                format!(
+                                    "{} {} · {} {}",
+                                    check.folders,
+                                    if check.folders == 1 {
+                                        "folder"
+                                    } else {
+                                        "folders"
+                                    },
+                                    check.messages,
+                                    if check.messages == 1 {
+                                        "message"
+                                    } else {
+                                        "messages"
+                                    }
+                                ),
+                            ))
+                        },
+                    ),
             )
             .child(hint(
                 if exporting {
@@ -1416,8 +1570,8 @@ impl Render for Migrator {
 
 #[cfg(test)]
 mod tests {
-    use super::{Event, Migrator, Page, configure_theme};
-    use crate::engine::{Imports, Resume};
+    use super::{Event, Migrator, Page, Security, configure_theme};
+    use crate::engine::{Imports, Resume, Source, SourceCheck};
     use gpui_kit::{AppContext, TestAppContext, WindowOptions, open_window, test::TestWindowExt};
 
     #[gpui_kit::test]
@@ -1498,8 +1652,17 @@ mod tests {
             });
             window.render_frame(cx);
             window.click("import", cx);
+            assert_eq!(view.read(cx).server.read(cx).value().as_ref(), "");
+            assert_eq!(view.read(cx).port.read(cx).value().as_ref(), "993");
+            assert_eq!(window.find("review").label(), Some("Check connection"));
             window.click("review", cx);
             assert!(view.read(cx).problem.is_some());
+            window.click("security-starttls", cx);
+            assert_eq!(view.read(cx).port.read(cx).value().as_ref(), "143");
+            window.click("security-tls", cx);
+            assert_eq!(view.read(cx).port.read(cx).value().as_ref(), "993");
+            window.click("IMAP server", cx);
+            window.input("imap.example.invalid", cx);
             window.click("Mailbox login", cx);
             window.input("source@example.invalid", cx);
             window.press("tab", cx);
@@ -1508,7 +1671,34 @@ mod tests {
                 view.read(cx).source_password.read(cx).value().as_ref(),
                 "synthetic-secret"
             );
-            window.click("review", cx);
+            assert!(matches!(
+                view.read(cx).source(cx),
+                Ok(Source::Imap { ref server, ref port, ref security, .. })
+                    if server == "imap.example.invalid" && port == "993" && security == "tls"
+            ));
+            view.update(cx, |v, cx| {
+                v.receive(
+                    Event::SourceChecked {
+                        check: SourceCheck {
+                            address: "imap.example.invalid:993".into(),
+                            security: "tls".into(),
+                            folders: 4,
+                            messages: 1,
+                        },
+                    },
+                    window,
+                    cx,
+                )
+            });
+            window.render_frame(cx);
+            assert!(view.read(cx).page == Page::Review);
+            assert_eq!(
+                view.read(cx)
+                    .checked
+                    .as_ref()
+                    .map(|c| (c.folders, c.messages)),
+                Some((4, 1))
+            );
             assert_eq!(window.find("start").label(), Some("Start import"));
             window.click("back", cx);
             window.click("files", cx);
@@ -1548,6 +1738,8 @@ mod tests {
                         resume: Some(Resume {
                             kind: "imap".into(),
                             server: "imap.example.invalid".into(),
+                            port: "143".into(),
+                            security: "starttls".into(),
                             path: String::new(),
                             directory: String::new(),
                         }),
@@ -1579,6 +1771,8 @@ mod tests {
                 view.read(cx).server.read(cx).value().as_ref(),
                 "imap.example.invalid"
             );
+            assert_eq!(view.read(cx).port.read(cx).value().as_ref(), "143");
+            assert_eq!(view.read(cx).security, Security::StartTls);
             assert_eq!(view.read(cx).username.read(cx).value().as_ref(), "");
             view.update(cx, |v, cx| {
                 v.receive(

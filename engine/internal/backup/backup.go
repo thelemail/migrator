@@ -2,6 +2,7 @@ package backup
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -31,9 +32,46 @@ func Run(ctx context.Context, s *session.Session, out string, progress func(fold
 	defer func() { _ = lock.Close() }()
 	err = s.Export(ctx, out, io.Discard, progress)
 	if errors.Is(err, transfer.ErrIncomplete) {
-		return fmt.Errorf("%w; see export-report.json in the output folder", err)
+		return incomplete(out, err)
 	}
 	return err
+}
+
+type Incomplete struct {
+	Report      string
+	Pending     int
+	Lost        int
+	KeyProblems bool
+	Err         error
+}
+
+func (e *Incomplete) Error() string {
+	return fmt.Sprintf("%v: %d pending, %d unreadable, see %s", e.Err, e.Pending, e.Lost, e.Report)
+}
+
+func (e *Incomplete) Unwrap() error { return e.Err }
+
+func incomplete(out string, err error) error {
+	path := filepath.Join(out, "export-report.json")
+	result := &Incomplete{Report: path, Err: err}
+	raw, readErr := os.ReadFile(path)
+	if readErr != nil {
+		result.KeyProblems = true
+		return result
+	}
+	var report struct {
+		Pending     []json.RawMessage `json:"pending"`
+		Lost        []json.RawMessage `json:"lost"`
+		KeyWarnings []json.RawMessage `json:"keyWarnings"`
+		KeyCheck    string            `json:"keyCheck"`
+	}
+	if json.Unmarshal(raw, &report) != nil {
+		result.KeyProblems = true
+		return result
+	}
+	result.Pending, result.Lost = len(report.Pending), len(report.Lost)
+	result.KeyProblems = len(report.KeyWarnings) > 0 || report.KeyCheck != ""
+	return result
 }
 
 func claimDirectory(dir, account string) error {

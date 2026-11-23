@@ -13,6 +13,8 @@ import (
 type resumable struct {
 	Kind      string `json:"kind"`
 	Server    string `json:"server,omitempty"`
+	Port      string `json:"port,omitempty"`
+	Security  string `json:"security,omitempty"`
 	Path      string `json:"path,omitempty"`
 	Directory string `json:"directory,omitempty"`
 }
@@ -31,7 +33,7 @@ func rememberTransfer(account string, src transferSource) error {
 	if err != nil {
 		return err
 	}
-	raw, err := json.Marshal(resumable{Kind: src.Kind, Server: src.Server, Path: src.Path, Directory: src.Directory})
+	raw, err := json.Marshal(resumable{Kind: src.Kind, Server: src.Server, Port: src.Port, Security: src.Security, Path: src.Path, Directory: src.Directory})
 	if err != nil {
 		return err
 	}

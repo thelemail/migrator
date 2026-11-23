@@ -13,6 +13,7 @@ pub enum Command {
     Login { email: String, password: String },
     Factor { method: String, code: String },
     Transfer { source: Source },
+    CheckSource { source: Source },
     VerifyKeys,
     Cancel,
 }
@@ -22,6 +23,8 @@ pub enum Command {
 pub enum Source {
     Imap {
         server: String,
+        port: String,
+        security: String,
         username: String,
         password: String,
     },
@@ -46,9 +49,21 @@ pub struct Resume {
     #[serde(default)]
     pub server: String,
     #[serde(default)]
+    pub port: String,
+    #[serde(default)]
+    pub security: String,
+    #[serde(default)]
     pub path: String,
     #[serde(default)]
     pub directory: String,
+}
+
+#[derive(Deserialize, Clone, Default, Debug, PartialEq, Eq)]
+pub struct SourceCheck {
+    pub address: String,
+    pub security: String,
+    pub folders: usize,
+    pub messages: usize,
 }
 
 #[derive(Deserialize)]
@@ -72,6 +87,9 @@ pub enum Event {
     KeysChecked {
         #[serde(default)]
         import: Imports,
+    },
+    SourceChecked {
+        check: SourceCheck,
     },
     SignedOut {
         #[serde(default)]

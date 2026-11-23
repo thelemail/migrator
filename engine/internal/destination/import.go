@@ -132,10 +132,23 @@ func (s client) importMessage(ctx context.Context, raw []byte, placement *Placem
 	if err != nil {
 		return false, err
 	}
-	body, err := s.upload(ctx, 0, bodyCipher)
-	if err != nil {
-		return false, fmt.Errorf("upload message body: %w", err)
+	ciphers := [][]byte{bodyCipher}
+	for i, file := range m.files {
+		frame, err := attframe.Build(file.header, file.payload)
+		if err != nil {
+			return false, fmt.Errorf("%w: prepare attachment %d: %v", ErrInvalidMessage, i+1, err)
+		}
+		cipher, err := encrypt(frame)
+		if err != nil {
+			return false, err
+		}
+		ciphers = append(ciphers, cipher)
 	}
+	uploaded, err := s.uploadAll(ctx, ciphers)
+	if err != nil {
+		return false, err
+	}
+	body := uploaded[0]
 	req := importRequest{
 		Placement: placement, Version: 1, StoredAt: m.preview.Date, ContentHash: digest(raw),
 		ExternalID: m.header.Get("Message-ID"), InReplyTo: m.header.Get("In-Reply-To"),
@@ -150,18 +163,7 @@ func (s client) importMessage(ctx context.Context, raw []byte, placement *Placem
 		req.References = req.References[len(req.References)-64:]
 	}
 	for i, file := range m.files {
-		frame, err := attframe.Build(file.header, file.payload)
-		if err != nil {
-			return false, fmt.Errorf("%w: prepare attachment %d: %v", ErrInvalidMessage, i+1, err)
-		}
-		cipher, err := encrypt(frame)
-		if err != nil {
-			return false, err
-		}
-		d, err := s.upload(ctx, i, cipher)
-		if err != nil {
-			return false, fmt.Errorf("upload attachment %d: %w", i+1, err)
-		}
+		d := uploaded[i+1]
 		d.Inline = file.header.Disposition == attframe.DispositionInline
 		if file.header.ContentID != "" {
 			d.ContentIDHash = digest([]byte(file.header.ContentID))
@@ -210,27 +212,53 @@ func (c client) imported(ctx context.Context, keys [][]byte) (map[string]bool, e
 
 const lookupBatch = 500
 
-func (s client) upload(ctx context.Context, ordinal int, cipher []byte) (descriptor, error) {
-	info := cipherInfo{Ordinal: ordinal, Size: len(cipher), SHA: digest(cipher), Fingerprint: s.Fingerprint}
-	slotID := uuid.NewString()
-	var grants struct {
-		Slots []uploadGrant `json:"slots"`
+const grantBatch = 40
+
+func uploadLabel(part int) string {
+	if part == 0 {
+		return "message body"
 	}
-	if err := s.post(ctx, "/v1/attachments/upload-urls", map[string][]uploadSlot{"slots": {{info, slotID, "sender"}}}, &grants); err != nil {
-		return descriptor{}, err
+	return fmt.Sprintf("attachment %d", part)
+}
+
+func (s client) uploadAll(ctx context.Context, ciphers [][]byte) ([]descriptor, error) {
+	out := make([]descriptor, 0, len(ciphers))
+	for start := 0; start < len(ciphers); start += grantBatch {
+		batch := ciphers[start:min(start+grantBatch, len(ciphers))]
+		slots := make([]uploadSlot, len(batch))
+		for i, cipher := range batch {
+			ordinal := max(start+i-1, 0)
+			slots[i] = uploadSlot{cipherInfo{Ordinal: ordinal, Size: len(cipher), SHA: digest(cipher), Fingerprint: s.Fingerprint}, uuid.NewString(), "sender"}
+		}
+		var grants struct {
+			Slots []uploadGrant `json:"slots"`
+		}
+		if err := s.post(ctx, "/v1/attachments/upload-urls", map[string][]uploadSlot{"slots": slots}, &grants); err != nil {
+			return nil, fmt.Errorf("upload %s: %w", uploadLabel(start), err)
+		}
+		byID := make(map[string]uploadGrant, len(grants.Slots))
+		for _, g := range grants.Slots {
+			byID[g.ID] = g
+		}
+		if len(grants.Slots) != len(slots) || len(byID) != len(slots) {
+			return nil, fmt.Errorf("invalid upload grant")
+		}
+		for i, slot := range slots {
+			g, ok := byID[slot.ID]
+			if !ok || g.ObjectKey == "" {
+				return nil, fmt.Errorf("invalid upload grant")
+			}
+			u, err := url.ParseRequestURI(g.PutPath)
+			if err != nil || u.IsAbs() || u.Host != "" || u.Path != "/v1/attachments/uploads" || u.Query().Get("objectKey") != g.ObjectKey {
+				return nil, fmt.Errorf("invalid attachment upload destination")
+			}
+			if err := s.request(ctx, http.MethodPut, g.PutPath, "application/octet-stream", batch[i], nil); err != nil {
+				return nil, fmt.Errorf("upload %s: %w", uploadLabel(start+i), err)
+			}
+			out = append(out, descriptor{cipherInfo: slot.cipherInfo, ObjectKey: g.ObjectKey})
+		}
 	}
-	if len(grants.Slots) != 1 || grants.Slots[0].ID != slotID || grants.Slots[0].ObjectKey == "" {
-		return descriptor{}, fmt.Errorf("invalid upload grant")
-	}
-	g := grants.Slots[0]
-	u, err := url.ParseRequestURI(g.PutPath)
-	if err != nil || u.IsAbs() || u.Host != "" || u.Path != "/v1/attachments/uploads" || u.Query().Get("objectKey") != g.ObjectKey {
-		return descriptor{}, fmt.Errorf("invalid attachment upload destination")
-	}
-	if err := s.request(ctx, http.MethodPut, g.PutPath, "application/octet-stream", cipher, nil); err != nil {
-		return descriptor{}, err
-	}
-	return descriptor{cipherInfo: info, ObjectKey: g.ObjectKey}, nil
+	return out, nil
 }
 
 func (s client) post(ctx context.Context, path string, data, out any) error {

@@ -33,8 +33,16 @@ case "$TARGET" in
     chmod +x "$OUTDIR/thelemail-migrator-${VERSION}-linux-x86_64.AppImage"
     ;;
   windows)
-    cp target/release/thelemail-migrator.exe "$OUTDIR/thelemail-migrator-${VERSION}-windows-x86_64.exe"
-    cp target/release/migrator-engine.exe "$OUTDIR/migrator-engine.exe"
+    iscc="${ISCC:-/c/Program Files (x86)/Inno Setup 6/ISCC.exe}"
+    if [ ! -x "$iscc" ]; then
+      echo "Inno Setup compiler not found at $iscc; set ISCC" >&2
+      exit 1
+    fi
+    out="$(cd "$OUTDIR" && pwd)"
+    "$iscc" /Qp "/DAppVersion=${VERSION}" "/DSourceDir=$(cygpath -w "$PWD/target/release")" \
+      "/DOutputDir=$(cygpath -w "$out")" "$(cygpath -w "$PWD/installer/migrator.iss")"
+    mkdir -p "$OUTDIR/check"
+    cp target/release/migrator-engine.exe "$OUTDIR/check/migrator-engine-windows-amd64.exe"
     ;;
   *)
     echo "unknown target $TARGET" >&2

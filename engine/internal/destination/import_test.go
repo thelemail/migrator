@@ -47,6 +47,7 @@ func TestImportWireRoundTrip(t *testing.T) {
 	starred := false
 	rejectPlacement := false
 	attempts := 0
+	grantCalls := 0
 	const storedID = "9c89c472-e461-49d2-afde-a6f556c295c7"
 	fake := func(req *http.Request) (*http.Response, error) {
 		if req.URL.Host != "api.example.test" {
@@ -59,12 +60,16 @@ func TestImportWireRoundTrip(t *testing.T) {
 			if err := json.NewDecoder(req.Body).Decode(&grants); err != nil {
 				t.Fatal(err)
 			}
-			slot := grants.Slots[0]
-			if slot.Role != "sender" || !bytes.Equal(slot.Fingerprint, fp) {
-				t.Fatal("slot did not bind to mailbox key")
+			grantCalls++
+			var issued []uploadGrant
+			for _, slot := range grants.Slots {
+				if slot.Role != "sender" || !bytes.Equal(slot.Fingerprint, fp) {
+					t.Fatal("slot did not bind to mailbox key")
+				}
+				slots[slot.ID] = slot
+				issued = append(issued, uploadGrant{slot.ID, slot.ID, "/v1/attachments/uploads?objectKey=" + slot.ID})
 			}
-			slots[slot.ID] = slot
-			response = map[string]any{"slots": []uploadGrant{{slot.ID, slot.ID, "/v1/attachments/uploads?objectKey=" + slot.ID}}}
+			response = map[string]any{"slots": issued}
 		case "PUT /v1/attachments/uploads":
 			id := req.URL.Query().Get("objectKey")
 			blobs[id], err = io.ReadAll(req.Body)
@@ -94,6 +99,9 @@ func TestImportWireRoundTrip(t *testing.T) {
 	existing, err := c.importMessage(context.Background(), example, nil, time.Time{})
 	if err != nil || existing {
 		t.Fatalf("import: existing=%t, err=%v", existing, err)
+	}
+	if grantCalls != 1 {
+		t.Fatalf("asked for upload grants %d times for one message", grantCalls)
 	}
 	if len(in.Attachments) != 1 || in.ExternalID != "<example@example.org>" || in.InReplyTo != "<parent@example.org>" || len(in.References) != 2 || !bytes.Equal(in.ContentHash, digest(example)) {
 		t.Fatal("import is missing attachments, original threading or content hash")
@@ -169,7 +177,7 @@ func TestRejectRedirectedGrantAndInvalidArchives(t *testing.T) {
 		b := fmt.Sprintf(`{"slots":[{"slotId":%q,"objectKey":"key","putPath":"https://elsewhere.test/v1/attachments/uploads?objectKey=key"}]}`, in.Slots[0].ID)
 		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(b))}, nil
 	}}
-	if _, err := s.upload(context.Background(), 0, []byte("ciphertext")); err == nil {
+	if _, err := s.uploadAll(context.Background(), [][]byte{[]byte("ciphertext")}); err == nil {
 		t.Fatal("accepted foreign upload grant")
 	}
 	for _, data := range [][]byte{[]byte("not an email"), bytes.Replace(example, []byte("AAECA/8="), []byte("BAD#"), 1), bytes.Replace(example, []byte("--outer--"), []byte("missing delimiter"), 1)} {

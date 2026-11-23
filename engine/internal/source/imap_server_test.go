@@ -90,6 +90,30 @@ func TestIMAPSignsInWithPlainOverStartTLS(t *testing.T) {
 	}
 }
 
+func TestCheckSignsInAndCountsTheMailbox(t *testing.T) {
+	f := startFixture(t)
+	f.add(t, "INBOX", 3)
+	f.add(t, "Archive", 1, imap.FlagSeen)
+	host, port, _ := net.SplitHostPort(f.address)
+	account := IMAPAccount{Server: host, Port: port, Security: SecurityStartTLS, Username: "owner@example.test", Password: "app password"}
+	summary, err := Check(t.Context(), account)
+	if err != nil {
+		t.Fatalf("check: %v", err)
+	}
+	if summary.Address != f.address || !summary.StartTLS || summary.Folders != 2 || summary.Messages != 4 {
+		t.Fatalf("summary %+v", summary)
+	}
+	account.Password = "wrong"
+	var signIn *SignInError
+	if _, err := Check(t.Context(), account); !errors.Is(err, ErrSourceSignIn) || !errors.As(err, &signIn) || signIn.Host != host {
+		t.Fatalf("wrong password: %v", err)
+	}
+	account.Password, account.Security = "app password", SecurityTLS
+	if _, err := Check(t.Context(), account); err == nil || errors.Is(err, ErrSourceSignIn) {
+		t.Fatalf("implicit TLS against a STARTTLS server: %v", err)
+	}
+}
+
 func TestIMAPSkipsVirtualMailboxesAndKnownMessages(t *testing.T) {
 	f := startFixture(t)
 	f.add(t, "INBOX", 3)

@@ -16,13 +16,22 @@ import (
 	"github.com/thelemail/migrator/engine/internal/source"
 )
 
-type transferSource struct{ Kind, Server, Username, Password, Path, Directory string }
+type transferSource struct{ Kind, Server, Port, Security, Username, Password, Path, Directory string }
+
+func (src transferSource) account() source.IMAPAccount {
+	return source.IMAPAccount{Server: strings.TrimSpace(src.Server), Port: strings.TrimSpace(src.Port), Security: src.Security, Username: strings.TrimSpace(src.Username), Password: src.Password}
+}
 
 func (src transferSource) validate() error {
 	switch src.Kind {
 	case "imap":
 		if strings.TrimSpace(src.Server) == "" || strings.TrimSpace(src.Username) == "" || src.Password == "" {
 			return errors.New("enter the source IMAP server, email address and password")
+		}
+		switch src.Security {
+		case "", source.SecurityTLS, source.SecurityStartTLS:
+		default:
+			return errors.New("choose SSL/TLS or STARTTLS")
 		}
 	case "files":
 		if src.Path == "" {
@@ -205,7 +214,7 @@ func copyMail(ctx context.Context, s *session.Session, src transferSource, progr
 		if isDirectory {
 			err = source.FileMailbox(ctx, src.Path, key, open, progress)
 		} else {
-			account := source.IMAPAccount{Server: strings.TrimSpace(src.Server), Username: strings.TrimSpace(src.Username), Password: src.Password}
+			account := src.account()
 			progress("Connecting to the source mailbox…")
 			var confirmed int
 			confirmed, err = source.IMAP(ctx, account, s.AccountID, stateDir, key, open, known, progress)

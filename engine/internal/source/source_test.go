@@ -146,15 +146,30 @@ func TestIMAPResumeAndLateArrival(t *testing.T) {
 }
 
 func TestServerAddress(t *testing.T) {
-	for _, s := range []string{"", "http://example.com", "example.com:0", "name@example.com", "example.com:bad"} {
-		if _, err := serverAddress(s); err == nil {
-			t.Fatalf("accepted %q", s)
+	for _, c := range [][2]string{{"", ""}, {"http://example.com", ""}, {"example.com:0", ""}, {"name@example.com", ""}, {"example.com:bad", ""}, {"example.com", "0"}, {"example.com", "70000"}, {"example.com", "abc"}, {"example.com:993", "143"}} {
+		if _, err := serverAddress(c[0], c[1]); err == nil {
+			t.Fatalf("accepted %q port %q", c[0], c[1])
 		}
 	}
-	for s, want := range map[string]string{"imap.hostinger.com": "imap.hostinger.com:993", "[::1]:123": "[::1]:123"} {
-		if got, err := serverAddress(s); err != nil || got != want {
-			t.Fatalf("%q -> %q, %v", s, got, err)
+	for c, want := range map[[2]string]string{
+		{"imap.example.test", ""}:        "imap.example.test:993",
+		{"imap.example.test", "143"}:     "imap.example.test:143",
+		{" imap.example.test ", "1143"}:  "imap.example.test:1143",
+		{"imap.example.test:993", "993"}: "imap.example.test:993",
+		{"[::1]:123", ""}:                "[::1]:123",
+		{"::1", "993"}:                   "[::1]:993",
+	} {
+		if got, err := serverAddress(c[0], c[1]); err != nil || got != want {
+			t.Fatalf("%q port %q -> %q, %v", c[0], c[1], got, err)
 		}
+	}
+	for c, want := range map[[2]string]bool{{"", "143"}: true, {"", "993"}: false, {SecurityTLS, "143"}: false, {SecurityStartTLS, "993"}: true} {
+		if got, err := useStartTLS(c[0], c[1]); err != nil || got != want {
+			t.Fatalf("security %q port %q -> %t, %v", c[0], c[1], got, err)
+		}
+	}
+	if _, err := useStartTLS("plain", "143"); err == nil {
+		t.Fatal("accepted an unknown connection security")
 	}
 }
 

@@ -10,10 +10,12 @@ import (
 	"log"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/thelemail/export-tool/transfer"
 	"github.com/thelemail/migrator/engine/internal/config"
 	"github.com/thelemail/migrator/engine/internal/session"
+	"github.com/thelemail/migrator/engine/internal/source"
 )
 
 type command struct {
@@ -37,12 +39,21 @@ type event struct {
 	Version string       `json:"version,omitempty"`
 	Import  *importState `json:"import,omitempty"`
 	Resume  *resumable   `json:"resume,omitempty"`
+	Check   *sourceCheck `json:"check,omitempty"`
+}
+
+type sourceCheck struct {
+	Address  string `json:"address"`
+	Security string `json:"security"`
+	Folders  int    `json:"folders"`
+	Messages int    `json:"messages"`
 }
 
 type mailbox struct {
 	email    string
 	imports  importState
 	resume   *resumable
+	check    func(context.Context, transferSource) (sourceCheck, error)
 	transfer func(context.Context, transferSource, func(string)) error
 	verify   func(context.Context) importState
 	close    func()
@@ -86,6 +97,7 @@ func openMailbox(ctx context.Context, email, password string, prompt session.Fac
 	}
 	return &mailbox{
 		email: address, imports: importsOf(s), resume: last, close: s.Close,
+		check: checkSource,
 		transfer: func(ctx context.Context, src transferSource, progress func(string)) error {
 			return runTransfer(ctx, s, src, progress)
 		},
@@ -174,6 +186,9 @@ func serve(input io.Reader, output io.Writer, login loginFunc) error {
 			case c.Type == "transfer" && mail != nil:
 				m := mail
 				start(func(ctx context.Context) { transferMail(ctx, m, c.Source, changes) })
+			case c.Type == "check_source" && mail != nil:
+				m := mail
+				start(func(ctx context.Context) { checkMailbox(ctx, m, c.Source, changes) })
 			case c.Type == "verify_keys" && mail != nil:
 				m := mail
 				start(func(ctx context.Context) { verifyKeys(ctx, m, changes) })
@@ -259,6 +274,35 @@ func transferMail(ctx context.Context, mail *mailbox, src transferSource, change
 		out.Type = "signed_out"
 	}
 	changes <- update{event: out, done: true, ended: ended}
+}
+
+func checkMailbox(ctx context.Context, mail *mailbox, src transferSource, changes chan<- update) {
+	checked, err := mail.check(ctx, src)
+	out := result(ctx, err, "source_checked", "")
+	if err == nil && ctx.Err() == nil {
+		out.Check = &checked
+	}
+	changes <- update{event: out, done: true}
+}
+
+func checkSource(ctx context.Context, src transferSource) (sourceCheck, error) {
+	if src.Kind != "imap" {
+		return sourceCheck{}, errors.New("only IMAP mailboxes need a connection check")
+	}
+	if err := src.validate(); err != nil {
+		return sourceCheck{}, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+	summary, err := source.Check(ctx, src.account())
+	if err != nil {
+		return sourceCheck{}, err
+	}
+	security := source.SecurityTLS
+	if summary.StartTLS {
+		security = source.SecurityStartTLS
+	}
+	return sourceCheck{Address: summary.Address, Security: security, Folders: summary.Folders, Messages: summary.Messages}, nil
 }
 
 func verifyKeys(ctx context.Context, mail *mailbox, changes chan<- update) {

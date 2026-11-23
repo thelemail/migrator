@@ -23,40 +23,126 @@ import (
 	"github.com/emersion/go-sasl"
 )
 
-func serverAddress(server string) (string, error) {
+func serverAddress(server, port string) (string, error) {
 	server = strings.TrimSpace(server)
+	port = strings.TrimSpace(port)
 	if server == "" || strings.ContainsAny(server, "/@?# \t\r\n") {
-		return "", errors.New("enter the IMAP hostname, optionally followed by a port")
+		return "", errors.New("enter the IMAP server name, for example imap.example.com")
 	}
-	if _, _, err := net.SplitHostPort(server); err != nil {
-		if strings.Contains(server, ":") && net.ParseIP(server) == nil {
-			return "", errors.New("invalid IMAP host or port")
+	if host, given, err := net.SplitHostPort(server); err == nil {
+		if port != "" && port != given {
+			return "", errors.New("enter the port in the Port field only")
 		}
-		server = net.JoinHostPort(server, "993")
+		server, port = host, given
+	} else if strings.Contains(server, ":") && net.ParseIP(server) == nil {
+		return "", errors.New("invalid IMAP server name")
 	}
-	host, port, _ := net.SplitHostPort(server)
+	if port == "" {
+		port = "993"
+	}
 	n, err := strconv.Atoi(port)
-	if host == "" || err != nil || n < 1 || n > 65535 {
-		return "", errors.New("invalid IMAP host or port")
+	if err != nil || n < 1 || n > 65535 {
+		return "", errors.New("enter a port number between 1 and 65535")
 	}
-	return server, nil
+	return net.JoinHostPort(server, strconv.Itoa(n)), nil
 }
 
-type IMAPAccount struct{ Server, Username, Password string }
+type IMAPAccount struct{ Server, Port, Security, Username, Password string }
+
+const (
+	SecurityTLS      = "tls"
+	SecurityStartTLS = "starttls"
+)
 
 var ErrSourceSignIn = errors.New("the source mailbox did not accept the sign-in")
+
+type SignInError struct {
+	Host string
+	Err  error
+}
+
+func (e *SignInError) Error() string { return fmt.Sprintf("%v: %v", ErrSourceSignIn, e.Err) }
+
+func (e *SignInError) Unwrap() []error { return []error{ErrSourceSignIn, e.Err} }
+
+type ConnectError struct {
+	Address  string
+	StartTLS bool
+	Err      error
+}
+
+func (e *ConnectError) Error() string { return fmt.Sprintf("connect to IMAP %s: %v", e.Address, e.Err) }
+
+func (e *ConnectError) Unwrap() error { return e.Err }
 
 const startTLSPort = "143"
 
 var trustedRoots *x509.CertPool
 
+func useStartTLS(security, port string) (bool, error) {
+	switch security {
+	case SecurityStartTLS:
+		return true, nil
+	case SecurityTLS:
+		return false, nil
+	case "":
+		return port == startTLSPort, nil
+	}
+	return false, errors.New("choose SSL/TLS or STARTTLS")
+}
+
 func connectIMAP(ctx context.Context, account IMAPAccount) (*imapclient.Client, func(), string, error) {
-	address, err := serverAddress(account.Server)
+	address, err := serverAddress(account.Server, account.Port)
 	if err != nil {
 		return nil, nil, "", err
 	}
 	_, port, _ := net.SplitHostPort(address)
-	return connectWith(ctx, IMAPAccount{Server: address, Username: account.Username, Password: account.Password}, port == startTLSPort)
+	startTLS, err := useStartTLS(account.Security, port)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	return connectWith(ctx, IMAPAccount{Server: address, Username: account.Username, Password: account.Password}, startTLS)
+}
+
+type Summary struct {
+	Address  string
+	StartTLS bool
+	Folders  int
+	Messages int
+}
+
+func Check(ctx context.Context, account IMAPAccount) (Summary, error) {
+	client, closeClient, address, err := connectIMAP(ctx, account)
+	if err != nil {
+		return Summary{}, err
+	}
+	defer closeClient()
+	_, port, _ := net.SplitHostPort(address)
+	startTLS, _ := useStartTLS(account.Security, port)
+	opts := &imap.ListOptions{ReturnSpecialUse: client.Caps().Has(imap.CapSpecialUse)}
+	list, err := client.List("", "*", opts).Collect()
+	if err != nil {
+		return Summary{}, fmt.Errorf("list source folders: %w", err)
+	}
+	folders := folderPlan(list)
+	if len(folders) == 0 {
+		return Summary{}, errors.New("the source server returned no selectable mail folders")
+	}
+	summary := Summary{Address: address, StartTLS: startTLS, Folders: len(folders)}
+	for _, folder := range folders {
+		if err := ctx.Err(); err != nil {
+			return Summary{}, err
+		}
+		status, err := client.Status(folder.Name, &imap.StatusOptions{NumMessages: true}).Wait()
+		if err != nil {
+			return Summary{}, fmt.Errorf("count messages in %q: %w", folder.Name, err)
+		}
+		if status.NumMessages != nil {
+			summary.Messages += int(*status.NumMessages)
+		}
+	}
+	_ = client.Logout().Wait()
+	return summary, nil
 }
 
 func connectWith(ctx context.Context, account IMAPAccount, startTLS bool) (*imapclient.Client, func(), string, error) {
@@ -74,7 +160,7 @@ func connectWith(ctx context.Context, account IMAPAccount, startTLS bool) (*imap
 		conn, err = (&tls.Dialer{NetDialer: dialer, Config: tlsConfig}).DialContext(ctx, "tcp", address)
 	}
 	if err != nil {
-		return nil, nil, "", fmt.Errorf("connect to IMAP: %w", err)
+		return nil, nil, "", &ConnectError{Address: address, StartTLS: startTLS, Err: err}
 	}
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	var client *imapclient.Client
@@ -82,7 +168,7 @@ func connectWith(ctx context.Context, account IMAPAccount, startTLS bool) (*imap
 		client, err = imapclient.NewStartTLS(conn, &imapclient.Options{TLSConfig: tlsConfig})
 		if err != nil {
 			stop()
-			return nil, nil, "", fmt.Errorf("start TLS with the IMAP server: %w", err)
+			return nil, nil, "", &ConnectError{Address: address, StartTLS: true, Err: fmt.Errorf("start TLS: %w", err)}
 		}
 	} else {
 		client = imapclient.New(conn, nil)
@@ -90,7 +176,7 @@ func connectWith(ctx context.Context, account IMAPAccount, startTLS bool) (*imap
 	closeClient := func() { stop(); _ = client.Close() }
 	if err := signIn(client, account); err != nil {
 		closeClient()
-		return nil, nil, "", fmt.Errorf("%w: %w", ErrSourceSignIn, err)
+		return nil, nil, "", &SignInError{Host: host, Err: err}
 	}
 	return client, closeClient, address, nil
 }
@@ -299,15 +385,20 @@ func copyFolder(ctx context.Context, client *imapclient.Client, folder, username
 		}
 	}
 	progress(fmt.Sprintf("%s · %d messages, %d previously copied", folder, len(uids), previous))
+	var todo []imap.UID
 	for _, uid := range uids {
+		if !cp.copied.Contains(uid) {
+			todo = append(todo, uid)
+		}
+	}
+	results, stopFetching := prefetch(ctx, client, todo)
+	defer stopFetching()
+	for next := range results {
 		if err := ctx.Err(); err != nil {
 			return previous, err
 		}
-		if cp.copied.Contains(uid) {
-			continue
-		}
+		uid, raw, info, readErr := next.uid, next.raw, next.info, next.err
 		name := fmt.Sprintf("%s UID %d", folder, uid)
-		raw, info, readErr := fetchMessage(client, uid)
 		if readErr != nil && !errors.Is(readErr, ErrTooLarge) {
 			return previous, fmt.Errorf("read %s: %w", name, readErr)
 		}
@@ -328,7 +419,46 @@ func copyFolder(ctx context.Context, client *imapclient.Client, folder, username
 			}
 		}
 	}
-	return previous, nil
+	return previous, ctx.Err()
+}
+
+const prefetchDepth = 2
+
+type fetched struct {
+	uid  imap.UID
+	raw  []byte
+	info MessageInfo
+	err  error
+}
+
+func prefetch(ctx context.Context, client *imapclient.Client, uids []imap.UID) (<-chan fetched, func()) {
+	ctx, cancel := context.WithCancel(ctx)
+	results := make(chan fetched, prefetchDepth)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer close(results)
+		for _, uid := range uids {
+			if ctx.Err() != nil {
+				return
+			}
+			raw, info, err := fetchMessage(client, uid)
+			select {
+			case results <- fetched{uid, raw, info, err}:
+			case <-ctx.Done():
+				return
+			}
+			if err != nil && !errors.Is(err, ErrTooLarge) {
+				return
+			}
+		}
+	}()
+	return results, func() {
+		cancel()
+		for range results {
+		}
+		<-done
+	}
 }
 
 func fetchMessage(client *imapclient.Client, uid imap.UID) ([]byte, MessageInfo, error) {
