@@ -39,7 +39,7 @@ case "$TARGET" in
       exit 1
     fi
     out="$(cd "$OUTDIR" && pwd)"
-    "$iscc" /Qp "/DAppVersion=${VERSION}" "/DSourceDir=$(cygpath -w "$PWD/target/release")" \
+    MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' "$iscc" /Qp "/DAppVersion=${VERSION}" "/DSourceDir=$(cygpath -w "$PWD/target/release")" \
       "/DOutputDir=$(cygpath -w "$out")" "$(cygpath -w "$PWD/installer/migrator.iss")"
     mkdir -p "$OUTDIR/check"
     cp target/release/migrator-engine.exe "$OUTDIR/check/migrator-engine-windows-amd64.exe"
