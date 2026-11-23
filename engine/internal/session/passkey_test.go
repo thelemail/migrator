@@ -36,7 +36,14 @@ func openedPage(t *testing.T, opened string) handBack {
 	if err != nil || u.Scheme+"://"+u.Host != testAuth || u.Path != "/migrator/passkey" || u.RawQuery != "" {
 		t.Fatalf("opened %q", opened)
 	}
-	parts, _ := url.ParseQuery(u.Fragment)
+	_, fragment, _ := strings.Cut(opened, "#")
+	if !strings.Contains(fragment, "account=ada%40thelemail.test") || strings.Contains(fragment, "%25") {
+		t.Fatalf("fragment %q is not escaped exactly once", fragment)
+	}
+	parts, err := url.ParseQuery(fragment)
+	if err != nil {
+		t.Fatalf("fragment %q: %v", fragment, err)
+	}
 	options, err := base64.RawURLEncoding.DecodeString(parts.Get("options"))
 	if err != nil {
 		t.Fatal(err)

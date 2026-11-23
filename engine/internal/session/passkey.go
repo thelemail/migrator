@@ -98,7 +98,9 @@ func requestPasskey(ctx context.Context, req transfer.PasskeyRequest, page passk
 	if err != nil {
 		return nil, err
 	}
-	target.Fragment = url.Values{
+	target.RawQuery = ""
+	target.Fragment = ""
+	uri := target.String() + "#" + url.Values{
 		"port":    {strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)},
 		"state":   {state},
 		"options": {base64.RawURLEncoding.EncodeToString(req.Options)},
@@ -107,7 +109,7 @@ func requestPasskey(ctx context.Context, req transfer.PasskeyRequest, page passk
 	if page.shown != nil {
 		page.shown(PasskeyCode(state))
 	}
-	if err := open(ctx, target.String()); err != nil {
+	if err := open(ctx, uri); err != nil {
 		return nil, errors.New("could not open your browser. Try again or choose another verification method")
 	}
 	select {

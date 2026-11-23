@@ -1,4 +1,4 @@
-.PHONY: build run run-local test test-e2e release engine-checksums app universal dist sign notarize
+.PHONY: build run run-local test test-e2e release engine-checksums app universal dist sign notarize dmg
 
 VERSION ?= $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 API ?= https://api.thelemail.com
@@ -11,6 +11,7 @@ CONFIG := github.com/thelemail/migrator/engine/internal/config
 LDFLAGS = -s -w -buildid= -X $(CONFIG).Version=$(VERSION) -X $(CONFIG).API=$(API) -X $(CONFIG).Web=$(WEB) -X $(CONFIG).Auth=$(AUTH)
 EXE := $(if $(filter Windows_NT,$(OS)),.exe,)
 APP := dist/Thelemail Migrator.app
+DMG = dist/Thelemail-Migrator-$(VERSION)-macos.dmg
 IDENTITY ?=
 NOTARY_PROFILE ?= thelemail-notary
 
@@ -63,8 +64,19 @@ sign: app
 	codesign --verify --deep --strict "$(APP)"
 
 notarize: sign
-	ditto -c -k --keepParent "$(APP)" "dist/Thelemail-Migrator-$(VERSION)-macos.zip"
-	xcrun notarytool submit "dist/Thelemail-Migrator-$(VERSION)-macos.zip" --keychain-profile "$(NOTARY_PROFILE)" --wait
+	ditto -c -k --keepParent "$(APP)" dist/notarize.zip
+	xcrun notarytool submit dist/notarize.zip --keychain-profile "$(NOTARY_PROFILE)" --wait
+	rm dist/notarize.zip
 	xcrun stapler staple "$(APP)"
-	rm "dist/Thelemail-Migrator-$(VERSION)-macos.zip"
-	ditto -c -k --keepParent "$(APP)" "dist/Thelemail-Migrator-$(VERSION)-macos.zip"
+	$(MAKE) dmg
+	codesign --force --timestamp --sign "$(IDENTITY)" "$(DMG)"
+	xcrun notarytool submit "$(DMG)" --keychain-profile "$(NOTARY_PROFILE)" --wait
+	xcrun stapler staple "$(DMG)"
+
+dmg:
+	rm -rf dist/dmg "$(DMG)"
+	mkdir -p dist/dmg
+	ditto "$(APP)" "dist/dmg/Thelemail Migrator.app"
+	ln -s /Applications dist/dmg/Applications
+	hdiutil create -volname "Thelemail Migrator" -srcfolder dist/dmg -fs HFS+ -format UDZO -ov "$(DMG)"
+	rm -rf dist/dmg
