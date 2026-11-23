@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Thelemail Migrator
+Comment=Import mail into Thelemail or export a readable copy
+Exec=thelemail-migrator
+Icon=AppIcon
+Terminal=false
+Categories=Network;Email;
